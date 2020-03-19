@@ -61,19 +61,18 @@ func main() {
 			Usage:       "Database password",
 			Destination: &args.DbPassword,
 			Value:       "feed_archiver",
-			EnvVars:     []string{"FA_DB_USER"},
+			EnvVars:     []string{"FA_DB_PASSWORD"},
 		},
 		&cli.StringFlag{
 			Name:        "mq-connstring",
 			Usage:       "RabbitMQ connection string",
 			Destination: &args.MqConnstring,
 			Value:       "amqp://guest:guest@localhost:5672/",
-			EnvVars:     []string{"FA_MQ_CONNSTRING"},
+			EnvVars:     []string{"FA_MQ_CONNSTR"},
 		},
 		&cli.StringSliceFlag{
 			Name:     "exchanges",
 			Usage:    "RabbitMQ exchanges",
-			Required: true,
 			EnvVars:  []string{"FA_EXCHANGES"},
 		},
 	}
@@ -115,6 +114,7 @@ func main() {
 
 	err := app.Run(os.Args)
 	if err != nil {
+		logrus.Error(err)
 		logrus.Fatal(app.OnUsageError)
 	}
 }
