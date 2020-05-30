@@ -1,14 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx"
 	"github.com/sirupsen/logrus"
-	"github.com/streadway/amqp"
 	"github.com/urfave/cli/v2"
 	"github.com/valyala/fastjson"
 	"os"
 	"strings"
+	"time"
 )
 
 var archiverCtx struct {
@@ -17,15 +19,14 @@ var archiverCtx struct {
 
 var pool *pgx.ConnPool
 var replacer = strings.NewReplacer(".", "_")
-var jsonParser fastjson.Parser
 
 type FeedArchiverArgs struct {
-	DbHost       string
-	DbUser       string
-	DbPassword   string
-	DbDatabase   string
-	MqConnstring string
-	Exchanges    []string
+	DbHost     string
+	DbUser     string
+	DbPassword string
+	DbDatabase string
+	RedisAddr  string
+	Pattern    string
 }
 
 func main() {
@@ -37,7 +38,7 @@ func main() {
 			Email: "me@simon987.net",
 		},
 	}
-	app.Version = "2.0"
+	app.Version = "3.0"
 
 	args := FeedArchiverArgs{}
 
@@ -64,22 +65,21 @@ func main() {
 			EnvVars:     []string{"FA_DB_PASSWORD"},
 		},
 		&cli.StringFlag{
-			Name:        "mq-connstring",
-			Usage:       "RabbitMQ connection string",
-			Destination: &args.MqConnstring,
-			Value:       "amqp://guest:guest@localhost:5672/",
-			EnvVars:     []string{"FA_MQ_CONNSTR"},
+			Name:        "redis-addr",
+			Usage:       "Redis addr",
+			Destination: &args.RedisAddr,
+			Value:       "localhost:6379",
+			EnvVars:     []string{"FA_REDIS_ADDR"},
 		},
-		&cli.StringSliceFlag{
-			Name:     "exchanges",
-			Usage:    "RabbitMQ exchanges",
-			EnvVars:  []string{"FA_EXCHANGES"},
+		&cli.StringFlag{
+			Name:        "pattern",
+			Usage:       "redis arc pattern",
+			Destination: &args.Pattern,
+			EnvVars:     []string{"FA_PATTERN"},
 		},
 	}
 
 	app.Action = func(c *cli.Context) error {
-
-		args.Exchanges = c.StringSlice("exchanges")
 
 		archiverCtx.tables = map[string]bool{}
 
@@ -101,15 +101,26 @@ func main() {
 			panic(err)
 		}
 
-		return consumeRabbitmqMessage(
-			args.MqConnstring,
-			args.Exchanges,
-			func(delivery amqp.Delivery) error {
-				table := routingKeyToTable(delivery.Exchange, delivery.RoutingKey, replacer)
-				archive(table, delivery.Body)
-				return nil
-			},
-		)
+		rdb := redis.NewClient(&redis.Options{
+			Addr:     args.RedisAddr,
+			Password: "",
+			DB:       0,
+		})
+
+		for i := 1; i <= 5; i++ {
+			var parser fastjson.Parser
+			go dispatchFromQueue(
+				rdb,
+				args.Pattern,
+				func(message string, key string) error {
+
+					table := routingKeyToTable(key[len(args.Pattern)-1:], replacer)
+					archive(parser, table, message)
+					return nil
+				},
+			)
+		}
+		return nil
 	}
 
 	err := app.Run(os.Args)
@@ -117,52 +128,49 @@ func main() {
 		logrus.Error(err)
 		logrus.Fatal(app.OnUsageError)
 	}
+	for {
+		time.Sleep(time.Second * 30)
+	}
 }
 
-func routingKeyToTable(exchange, routingKey string, replacer *strings.Replacer) string {
+func routingKeyToTable(key string, replacer *strings.Replacer) string {
 	var table string
-	if idx := strings.LastIndex(routingKey, "."); idx != -1 {
-		table = routingKey[:idx]
+	if idx := strings.LastIndex(key, "."); idx != -1 {
+		table = key[:idx]
 	}
 	table = replacer.Replace(table)
-	return exchange + "_" + table
+	return table
 }
 
-func archive(table string, json []byte) {
-	v, _ := jsonParser.ParseBytes(json)
+func archive(parser fastjson.Parser, table string, json string) {
+	item, _ := parser.Parse(json)
 
-	arr, err := v.Array()
-	if err != nil {
-		logrus.WithField("json", string(json)).Error("Message is not an array!")
+	idValue := item.Get("_id")
+	if idValue == nil {
+		logrus.WithField("json", string(json)).Error("Item with no _id field!")
 		return
 	}
 
-	for _, item := range arr {
-		idValue := item.Get("_id")
-		if idValue == nil {
-			logrus.WithField("json", string(json)).Error("Item with no _id field!")
-			return
-		}
+	var id interface{}
+	if idValue.Type() == fastjson.TypeNumber {
+		id, _ = idValue.Int64()
+	} else if idValue.Type() == fastjson.TypeString {
+		id, _ = idValue.StringBytes()
+	}
 
-		var id interface{}
-		if idValue.Type() == fastjson.TypeNumber {
-			id, _ = idValue.Int64()
-		} else if idValue.Type() == fastjson.TypeString {
-			id, _ = idValue.StringBytes()
-		}
+	_, tableExists := archiverCtx.tables[table]
+	if !tableExists {
+		createTable(table, idValue.Type())
+	}
 
-		_, tableExists := archiverCtx.tables[table]
-		if !tableExists {
-			createTable(table, idValue.Type())
-		}
+	logrus.WithFields(logrus.Fields{
+		"table": table,
+		"id":    idValue,
+	}).Debug("Insert row")
 
-		logrus.WithFields(logrus.Fields{
-			"table": table,
-			"id":    idValue,
-		}).Debug("Insert row")
-
-		_, err := pool.Exec(fmt.Sprintf("INSERT INTO %s (id, data) VALUES ($1, $2)", table), id, item.String())
-		if err != nil {
+	_, err := pool.Exec(fmt.Sprintf("INSERT INTO %s (id, data) VALUES ($1, $2)", table), id, item.String())
+	if err != nil {
+		if err.(pgx.PgError).Code != "23505" {
 			logrus.WithError(err).Error("Error during insert")
 		}
 	}
@@ -195,65 +203,30 @@ func createTable(table string, idType fastjson.Type) {
 	archiverCtx.tables[table] = true
 }
 
-func consumeRabbitmqMessage(host string, exchanges []string, consume func(amqp.Delivery) error) error {
+func dispatchFromQueue(rdb *redis.Client, pattern string, consume func(message string, key string) error) error {
 
-	conn, err := amqp.Dial(host)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
+	ctx := context.Background()
 
-	ch, err := conn.Channel()
-	if err != nil {
-		return err
-	}
-	defer ch.Close()
-
-	q, err := ch.QueueDeclare(
-		"",
-		false,
-		true,
-		true,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
-
-	for _, exchange := range exchanges {
-		err = ch.QueueBind(
-			q.Name,
-			"#",
-			exchange,
-			false,
-			nil)
+	for {
+		keys, err := rdb.Keys(ctx, pattern).Result()
 		if err != nil {
-			return err
+			logrus.WithField("Pattern", pattern).Error("Could not get keys for Pattern")
+			continue
 		}
-		logrus.WithFields(logrus.Fields{
-			"exchange": exchange,
-		}).Info("Queue bind")
-	}
 
-	msgs, err := ch.Consume(
-		q.Name,
-		"",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return err
-	}
+		if len(keys) == 0 {
+			time.Sleep(time.Second * 1)
+			continue
+		}
 
-	for d := range msgs {
-		err := consume(d)
+		rawTask, err := rdb.BLPop(ctx, time.Second*30, keys...).Result()
 		if err != nil {
-			return err
+			continue
+		}
+
+		err = consume(rawTask[1], rawTask[0])
+		if err != nil {
+			panic(err)
 		}
 	}
-	return nil
 }

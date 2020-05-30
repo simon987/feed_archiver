@@ -1,0 +1,3 @@
+elasticsearch
+psycopg2
+ujson
