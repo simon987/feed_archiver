@@ -203,17 +203,29 @@ func createTable(table string, idType fastjson.Type) {
 	archiverCtx.tables[table] = true
 }
 
+var keyCache []string = nil
+
+func getKeys(ctx context.Context, rdb *redis.Client, pattern string) []string {
+
+	if keyCache == nil {
+		keys, err := rdb.Keys(ctx, pattern).Result()
+		if err != nil {
+			logrus.WithField("Pattern", pattern).Error("Could not get keys for Pattern")
+			return nil
+		}
+
+		keyCache = keys
+	}
+
+	return keyCache
+}
+
 func dispatchFromQueue(rdb *redis.Client, pattern string, consume func(message string, key string) error) error {
 
 	ctx := context.Background()
 
 	for {
-		keys, err := rdb.Keys(ctx, pattern).Result()
-		if err != nil {
-			logrus.WithField("Pattern", pattern).Error("Could not get keys for Pattern")
-			continue
-		}
-
+		keys := getKeys(ctx, rdb, pattern)
 		if len(keys) == 0 {
 			time.Sleep(time.Second * 1)
 			continue
@@ -221,6 +233,7 @@ func dispatchFromQueue(rdb *redis.Client, pattern string, consume func(message s
 
 		rawTask, err := rdb.BLPop(ctx, time.Second*30, keys...).Result()
 		if err != nil {
+			keyCache = nil
 			continue
 		}
 
