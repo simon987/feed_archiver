@@ -5,6 +5,7 @@ WORKDIR /build/
 COPY main.go .
 COPY go.mod .
 RUN GOOS=linux CGO_ENABLED=0 go build -a -installsuffix cgo -o feed_archiver .
+RUN strip feed_archiver
 
 FROM scratch
 
