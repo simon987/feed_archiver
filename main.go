@@ -23,13 +23,14 @@ var pool *pgx.ConnPool
 var replacer = strings.NewReplacer(".", "_")
 
 type FeedArchiverArgs struct {
-	DbHost     string
-	DbUser     string
-	DbPassword string
-	DbDatabase string
-	RedisAddr  string
-	Pattern    string
-	Threads    int
+	DbHost        string
+	DbUser        string
+	DbPassword    string
+	DbDatabase    string
+	RedisAddr     string
+	RedisPassword string
+	Pattern       string
+	Threads       int
 }
 
 func main() {
@@ -75,6 +76,13 @@ func main() {
 			EnvVars:     []string{"FA_REDIS_ADDR"},
 		},
 		&cli.StringFlag{
+			Name:        "redis-password",
+			Usage:       "Redis password",
+			Destination: &args.RedisPassword,
+			Value:       "",
+			EnvVars:     []string{"FA_REDIS_PASSWORD"},
+		},
+		&cli.StringFlag{
 			Name:        "pattern",
 			Usage:       "redis arc pattern",
 			Destination: &args.Pattern,
@@ -113,7 +121,7 @@ func main() {
 
 		rdb := redis.NewClient(&redis.Options{
 			Addr:     args.RedisAddr,
-			Password: "",
+			Password: args.RedisPassword,
 			DB:       0,
 		})
 
