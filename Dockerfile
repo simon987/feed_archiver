@@ -1,5 +1,5 @@
 # Build
-FROM golang:1.13 as go_build
+FROM golang:1.15 as go_build
 WORKDIR /build/
 
 COPY main.go .
