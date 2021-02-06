@@ -23,14 +23,16 @@ var pool *pgx.ConnPool
 var replacer = strings.NewReplacer(".", "_")
 
 type FeedArchiverArgs struct {
-	DbHost        string
-	DbUser        string
-	DbPassword    string
-	DbDatabase    string
-	RedisAddr     string
-	RedisPassword string
-	Pattern       string
-	Threads       int
+	DbHost         string
+	DbUser         string
+	DbPassword     string
+	DbDatabase     string
+	RedisAddr      string
+	RedisPassword  string
+	Pattern        string
+	Threads        int
+	InfluxDb       string
+	InfluxDbBuffer int
 }
 
 func main() {
@@ -42,7 +44,7 @@ func main() {
 			Email: "me@simon987.net",
 		},
 	}
-	app.Version = "3.0"
+	app.Version = "4.0"
 
 	args := FeedArchiverArgs{}
 
@@ -95,13 +97,27 @@ func main() {
 			Destination: &args.Threads,
 			EnvVars:     []string{"FA_THREADS"},
 		},
+		&cli.StringFlag{
+			Name:        "influxdb",
+			Usage:       "Influxdb connection string",
+			Value:       "",
+			Destination: &args.InfluxDb,
+			EnvVars:     []string{"FA_INFLUXDB"},
+		},
+		&cli.IntFlag{
+			Name:        "influxdb-buffer",
+			Usage:       "Influxdb buffer size",
+			Value:       500,
+			Destination: &args.InfluxDbBuffer,
+			EnvVars:     []string{"FA_INFLUXDB_BUFFER"},
+		},
 	}
 
 	app.Action = func(c *cli.Context) error {
 
 		archiverCtx.tables = map[string]bool{}
 
-		logrus.SetLevel(logrus.InfoLevel)
+		logrus.SetLevel(logrus.DebugLevel)
 
 		connPoolConfig := pgx.ConnPoolConfig{
 			ConnConfig: pgx.ConnConfig{
@@ -111,6 +127,11 @@ func main() {
 				Database: args.DbDatabase,
 			},
 			MaxConnections: args.Threads,
+		}
+
+		var mon *Monitoring = nil
+		if args.InfluxDb != "" {
+			mon = NewMonitoring(args.InfluxDb, args.InfluxDbBuffer)
 		}
 
 		var err error
@@ -133,7 +154,7 @@ func main() {
 				func(message string, key string) error {
 
 					table := routingKeyToTable(key[len(args.Pattern)-1:], replacer)
-					archive(parser, table, message)
+					archive(parser, table, message, mon)
 					return nil
 				},
 			)
@@ -160,7 +181,7 @@ func routingKeyToTable(key string, replacer *strings.Replacer) string {
 	return table
 }
 
-func archive(parser fastjson.Parser, table string, json string) {
+func archive(parser fastjson.Parser, table string, json string, mon *Monitoring) {
 	item, _ := parser.Parse(json)
 
 	idValue := item.Get("_id")
@@ -188,11 +209,17 @@ func archive(parser fastjson.Parser, table string, json string) {
 		"id":    idValue,
 	}).Debug("Insert row")
 
+	messageSize := len(json)
+
 	_, err := pool.Exec(fmt.Sprintf("INSERT INTO %s (id, data) VALUES ($1, $2)", table), id, item.String())
 	if err != nil {
 		if err.(pgx.PgError).Code != "23505" {
 			logrus.WithError(err).Error("Error during insert")
+		} else if mon != nil {
+			mon.writeMetricUniqueViolation(messageSize, table)
 		}
+	} else if mon != nil {
+		mon.writeMetricInsertRow(messageSize, table)
 	}
 }
 
