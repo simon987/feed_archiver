@@ -117,7 +117,7 @@ func main() {
 
 		archiverCtx.tables = map[string]bool{}
 
-		logrus.SetLevel(logrus.DebugLevel)
+		logrus.SetLevel(logrus.InfoLevel)
 
 		connPoolConfig := pgx.ConnPoolConfig{
 			ConnConfig: pgx.ConnConfig{

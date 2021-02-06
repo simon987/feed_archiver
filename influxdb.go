@@ -58,7 +58,7 @@ func (m *Monitoring) flushQueue(bp *influx.BatchPoints) {
 
 	logrus.WithFields(logrus.Fields{
 		"size": len((*bp).Points()),
-	}).Debug("Wrote points")
+	}).Info("Wrote points")
 
 	*bp, _ = influx.NewBatchPoints(influx.BatchPointsConfig{
 		Database:        m.database,
