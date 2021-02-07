@@ -1,3 +1,4 @@
 elasticsearch
 psycopg2
 ujson
+git+git://github.com/simon987/hexlib.git
