@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"github.com/elastic/go-elasticsearch/v7"
 	"github.com/go-redis/redis/v8"
 	"github.com/jackc/pgx"
 	"github.com/sirupsen/logrus"
@@ -15,11 +15,22 @@ import (
 )
 
 var archiverCtx struct {
-	tables map[string]bool
-	m      sync.RWMutex
+	tables      map[string]bool
+	m           sync.RWMutex
+	ArchiveFunc func(*Record) error
+	Monitoring  *Monitoring
+	esIndex     string // TODO: based on routing key?
+}
+
+type Record struct {
+	Item       *fastjson.Value
+	IdValue    interface{}
+	IdType     fastjson.Type
+	RoutingKey string
 }
 
 var pool *pgx.ConnPool
+var es *elasticsearch.Client
 var replacer = strings.NewReplacer(".", "_")
 
 type FeedArchiverArgs struct {
@@ -27,6 +38,11 @@ type FeedArchiverArgs struct {
 	DbUser         string
 	DbPassword     string
 	DbDatabase     string
+	EsHost         string
+	EsUser         string
+	EsPassword     string
+	EsIndex        string
+	ArchiveTarget  string
 	RedisAddr      string
 	RedisPassword  string
 	Pattern        string
@@ -111,6 +127,43 @@ func main() {
 			Destination: &args.InfluxDbBuffer,
 			EnvVars:     []string{"FA_INFLUXDB_BUFFER"},
 		},
+		&cli.StringFlag{
+			Name:        "es-host",
+			Usage:       "Elasticsearch host",
+			Destination: &args.EsHost,
+			Value:       "http://localhost:9200",
+			EnvVars:     []string{"FA_ES_HOST"},
+		},
+		&cli.StringFlag{
+			Name:        "es-user",
+			Usage:       "Elasticsearch username",
+			Destination: &args.EsUser,
+			Value:       "elastic",
+			EnvVars:     []string{"FA_ES_USER"},
+		},
+		&cli.StringFlag{
+			Name:        "es-password",
+			Usage:       "Elasticsearch password",
+			Destination: &args.EsPassword,
+			Value:       "",
+			EnvVars:     []string{"FA_ES_PASSWORD"},
+		},
+
+		// TODO: Based on routing key?
+		&cli.StringFlag{
+			Name:        "es-index",
+			Usage:       "Elasticsearch index",
+			Destination: &args.EsIndex,
+			Value:       "feed_archiver",
+			EnvVars:     []string{"FA_ES_INDEX"},
+		},
+		&cli.StringFlag{
+			Name:        "target",
+			Usage:       "Either 'es' or 'sql'",
+			Destination: &args.ArchiveTarget,
+			Value:       "sql",
+			EnvVars:     []string{"FA_TARGET"},
+		},
 	}
 
 	app.Action = func(c *cli.Context) error {
@@ -129,15 +182,22 @@ func main() {
 			MaxConnections: args.Threads,
 		}
 
-		var mon *Monitoring = nil
-		if args.InfluxDb != "" {
-			mon = NewMonitoring(args.InfluxDb, args.InfluxDbBuffer)
+		if args.ArchiveTarget == "sql" {
+			var err error
+			pool, err = pgx.NewConnPool(connPoolConfig)
+			if err != nil {
+				panic(err)
+			}
+			archiverCtx.ArchiveFunc = archiveSql
+		} else {
+			es, _ = elasticsearch.NewDefaultClient()
+			archiverCtx.ArchiveFunc = archiveEs
+			archiverCtx.esIndex = args.EsIndex
 		}
 
-		var err error
-		pool, err = pgx.NewConnPool(connPoolConfig)
-		if err != nil {
-			panic(err)
+		archiverCtx.Monitoring = nil
+		if args.InfluxDb != "" {
+			archiverCtx.Monitoring = NewMonitoring(args.InfluxDb, args.InfluxDbBuffer)
 		}
 
 		rdb := redis.NewClient(&redis.Options{
@@ -153,9 +213,28 @@ func main() {
 				args.Pattern,
 				func(message string, key string) error {
 
-					table := routingKeyToTable(key[len(args.Pattern)-1:], replacer)
-					archive(parser, table, message, mon)
-					return nil
+					item, _ := parser.Parse(message)
+
+					id := item.Get("_id")
+					if id == nil {
+						logrus.WithField("json", key).Error("Item with no _id field!")
+						return nil
+					}
+
+					var idValue interface{}
+
+					if id.Type() == fastjson.TypeNumber {
+						idValue, _ = id.Int64()
+					} else if id.Type() == fastjson.TypeString {
+						idValue, _ = id.StringBytes()
+					}
+
+					return archiverCtx.ArchiveFunc(&Record{
+						Item:       item,
+						IdType:     id.Type(),
+						IdValue:    idValue,
+						RoutingKey: key[len(args.Pattern)-1:],
+					})
 				},
 			)
 		}
@@ -172,95 +251,34 @@ func main() {
 	}
 }
 
-func routingKeyToTable(key string, replacer *strings.Replacer) string {
-	var table string
-	if idx := strings.LastIndex(key, "."); idx != -1 {
-		table = key[:idx]
-	}
-	table = replacer.Replace(table)
-	return table
-}
-
-func archive(parser fastjson.Parser, table string, json string, mon *Monitoring) {
-	item, _ := parser.Parse(json)
-
-	idValue := item.Get("_id")
-	if idValue == nil {
-		logrus.WithField("json", string(json)).Error("Item with no _id field!")
-		return
-	}
-
-	var id interface{}
-	if idValue.Type() == fastjson.TypeNumber {
-		id, _ = idValue.Int64()
-	} else if idValue.Type() == fastjson.TypeString {
-		id, _ = idValue.StringBytes()
-	}
-
-	archiverCtx.m.RLock()
-	_, tableExists := archiverCtx.tables[table]
-	archiverCtx.m.RUnlock()
-	if !tableExists {
-		createTable(table, idValue.Type())
-	}
-
-	logrus.WithFields(logrus.Fields{
-		"table": table,
-		"id":    idValue,
-	}).Debug("Insert row")
-
-	messageSize := len(json)
-
-	_, err := pool.Exec(fmt.Sprintf("INSERT INTO %s (id, data) VALUES ($1, $2)", table), id, item.String())
-	if err != nil {
-		if err.(pgx.PgError).Code != "23505" {
-			logrus.WithError(err).Error("Error during insert")
-		} else if mon != nil {
-			mon.writeMetricUniqueViolation(messageSize, table)
-		}
-	} else if mon != nil {
-		mon.writeMetricInsertRow(messageSize, table)
-	}
-}
-
-func createTable(table string, idType fastjson.Type) {
-
-	logrus.WithFields(logrus.Fields{
-		"table": table,
-	}).Info("Create table (If not exists)")
-
-	var err error
-	var strType string
-	if idType == fastjson.TypeNumber {
-		strType = "bigint"
-	} else {
-		strType = "bytea"
-	}
-
-	_, err = pool.Exec(fmt.Sprintf("CREATE table IF NOT EXISTS %s ("+
-		"id %s PRIMARY KEY,"+
-		"archived_on TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,"+
-		"data JSONB NOT NULL"+
-		")", table, strType))
-
-	if err != nil {
-		logrus.WithError(err).Error("Error during create table")
-	}
-
-	archiverCtx.m.Lock()
-	archiverCtx.tables[table] = true
-	archiverCtx.m.Unlock()
-}
-
 var keyCache []string = nil
+
+// BLPOP with too many keys is slow!
+const maxKeys = 30
 
 func getKeys(ctx context.Context, rdb *redis.Client, pattern string) []string {
 
 	if keyCache == nil {
-		keys, err := rdb.Keys(ctx, pattern).Result()
-		if err != nil {
-			logrus.WithField("Pattern", pattern).Error("Could not get keys for Pattern")
-			return nil
+		var cur uint64 = 0
+		var keyRes []string
+		var keys []string
+		var err error
+
+		for {
+			keyRes, cur, err = rdb.Scan(ctx, cur, pattern, 10).Result()
+			if err != nil {
+				logrus.
+					WithError(err).
+					WithField("Pattern", pattern).
+					Error("Could not get keys for Pattern")
+				return nil
+			}
+
+			if cur == 0 || len(keys) >= maxKeys {
+				break
+			}
+
+			keys = append(keys, keyRes...)
 		}
 
 		keyCache = keys

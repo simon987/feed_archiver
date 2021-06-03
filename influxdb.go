@@ -95,3 +95,16 @@ func (m *Monitoring) writeMetricUniqueViolation(size int, table string) {
 	)
 	m.points <- point
 }
+
+func (m *Monitoring) writeMetricIndexDoc(table string) {
+
+	point, _ := influx.NewPoint(
+		"index_doc",
+		map[string]string{
+			"table": table,
+		},
+		map[string]interface{}{},
+		time.Now(),
+	)
+	m.points <- point
+}
